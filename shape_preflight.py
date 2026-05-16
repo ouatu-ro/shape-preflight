@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import argparse
 import time
+from typing import Any
 import numpy as np
 
 # ---------------------------------------------------------------------
@@ -15,7 +16,7 @@ def vector_program(cli_args, more, *, np):
     kept = np.filter(nums)
     return nums, both, x, tail, kept
 
-def matmul_program(x, w1, w2, *, iters=100, np=np):
+def matmul_program(x, w1, w2, *, iters=100, np:Any=np):
     h = x
     for _ in range(iters):
         h = np.maximum(h @ w1, 0)
