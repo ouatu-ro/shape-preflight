@@ -85,14 +85,16 @@ EXECUTE model-only: error elapsed=14.181211s
 
 ## Code Map
 
-- [`vector_program`](shape_preflight.py#L12): demo for symbolic vector lengths.
-- [`matmul_program`](shape_preflight.py#L19): user code written in normal NumPy style.
-- [`broadcast_shapes`](shape_preflight.py#L72): minimal NumPy-style broadcasting for metadata arrays.
-- [`MetaArray.__matmul__`](shape_preflight.py#L108): proxy hook for `@`.
-- [`PreflightNode`](shape_preflight.py#L137) and [`PreflightGraph`](shape_preflight.py#L147): structured preflight DAG.
-- [`PreflightGraph.to_dot`](shape_preflight.py#L240): DOT exporter.
-- [`PreflightNP`](shape_preflight.py#L277): metadata-only NumPy-ish proxy.
-- [`matmul_input_specs`](shape_preflight.py#L444): shared matrix shape setup for preflight and execute.
+- [`shape_preflight.py`](shape_preflight.py): user programs, demo runners, and CLI.
+- [`preflight_core.py`](preflight_core.py): metadata arrays, dimension logic, preflight DAG, and proxy backend.
+- [`vector_program`](shape_preflight.py#L15): demo for symbolic vector lengths.
+- [`matmul_program`](shape_preflight.py#L23): user code written in normal NumPy style.
+- [`broadcast_shapes`](preflight_core.py#L58): minimal NumPy-style broadcasting for metadata arrays.
+- [`MetaArray.__matmul__`](preflight_core.py#L97): proxy hook for `@`.
+- [`PreflightNode`](preflight_core.py#L132) and [`PreflightGraph`](preflight_core.py#L143): structured preflight DAG.
+- [`PreflightGraph.to_dot`](preflight_core.py#L237): DOT exporter.
+- [`PreflightNP`](preflight_core.py#L272): metadata-only NumPy-ish proxy.
+- [`matmul_input_specs`](shape_preflight.py#L53): shared matrix shape setup for preflight and execute.
 
 ## Status
 
