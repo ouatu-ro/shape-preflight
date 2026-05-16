@@ -4,7 +4,7 @@ Catch array shape errors before running expensive NumPy code.
 
 This is a small proof of concept for running one NumPy-style program in two modes:
 
-1. preflight: cheap metadata arrays record shape facts;
+1. preflight: cheap metadata arrays record shape facts in a typed preflight DAG;
 2. execute: real NumPy arrays run the same computation.
 
 The matrix example is ordinary NumPy-style code:
@@ -17,7 +17,7 @@ def matmul_program(x, w1, w2, *, iters=100, np=np):
     return h @ w2
 ```
 
-In preflight mode, `MetaArray.__matmul__` intercepts `h @ w1`, and the `PreflightNP` proxy handles `np.maximum(...)`. No numerical arrays are allocated for that path.
+In preflight mode, `MetaArray.__matmul__` intercepts `h @ w1`, and the `PreflightNP` proxy handles `np.maximum(...)`. No numerical arrays are allocated for that path; operations, dependencies, output metadata, violations, and unresolved obligations are recorded as structured DAG nodes.
 
 ## Try It
 
@@ -28,6 +28,8 @@ uv run shape_preflight.py matmul --run preflight --case ok --iters 3
 uv run shape_preflight.py matmul --run preflight --case bad-final-inner --iters 500
 uv run shape_preflight.py matmul --run execute --case bad-final-inner --iters 500
 ```
+
+The matrix demo defaults to a small preset, so execute mode is safe to try. Use `--preset large` when you specifically want the expensive-array version of the demo.
 
 The vector demo shows runtime length names and simple dimension arithmetic. `cli_args` represents the simulated command-line arguments. The tool models `foo bar baz` as a metadata vector with dtype `String` and symbolic length `argc = 3`, printed as `Vec<String, argc=3>`. With the default `--more-len 2`, `concat0` computes `argc + m = 5`, printed as `(argc+m)=5`.
 
@@ -54,13 +56,27 @@ preflight status: failed
 The matrix failure is caught after tracing the structural path:
 
 ```
+preflight DAG: 1004 nodes, showing last 8
+  [1003] matmul(1002, 2)
+
 violations:
-  [1003] matmul: inner dimension requires d=2048 == k=1024
+  [1003] matmul: inner dimension requires d=64 == k=32
 
 preflight status: failed
 ```
 
-Example timings on my machine with `--iters 500`:
+## DOT Export
+
+Preflight runs can emit a Graphviz DOT representation of the typed preflight DAG:
+
+```bash
+uv run shape_preflight.py matmul --run preflight --case bad-final-inner --iters 3 --dot-file shape.dot
+dot -Tsvg shape.dot -o shape.svg
+```
+
+Use `--dot` to print DOT to stdout. The DOT contains operation nodes, input edges, output shape metadata, and any violations or unresolved obligations. Use small traces such as `--iters 3` for readable diagrams.
+
+Example timings on my machine with `--preset large --iters 500`:
 
 ```
 PREFLIGHT model-only: error elapsed=0.001406s
@@ -69,14 +85,17 @@ EXECUTE model-only: error elapsed=14.181211s
 
 ## Code Map
 
-- [`vector_program`](shape_preflight.py#L11): demo for symbolic vector lengths.
-- [`matmul_program`](shape_preflight.py#L18): user code written in normal NumPy style.
-- [`MetaArray.__matmul__`](shape_preflight.py#L75): proxy hook for `@`.
-- [`PreflightNP`](shape_preflight.py#L141): metadata-only NumPy-ish proxy.
-- [`matmul_input_specs`](shape_preflight.py#L227): shared matrix shape setup for preflight and execute.
+- [`vector_program`](shape_preflight.py#L12): demo for symbolic vector lengths.
+- [`matmul_program`](shape_preflight.py#L19): user code written in normal NumPy style.
+- [`broadcast_shapes`](shape_preflight.py#L72): minimal NumPy-style broadcasting for metadata arrays.
+- [`MetaArray.__matmul__`](shape_preflight.py#L108): proxy hook for `@`.
+- [`PreflightNode`](shape_preflight.py#L137) and [`PreflightGraph`](shape_preflight.py#L147): structured preflight DAG.
+- [`PreflightGraph.to_dot`](shape_preflight.py#L240): DOT exporter.
+- [`PreflightNP`](shape_preflight.py#L277): metadata-only NumPy-ish proxy.
+- [`matmul_input_specs`](shape_preflight.py#L444): shared matrix shape setup for preflight and execute.
 
 ## Status
 
-This is not a dependent type system, a static type checker, or a proof of shape correctness. It is symbolic-lite abstract execution: dimensions have names and runtime values, and compatibility is checked using available concrete values.
+This is not a dependent type system, a static type checker, or a proof of shape correctness. It is symbolic-lite abstract execution over the executed path: dimensions have names and runtime values, known contradictions become violations, and unknown-but-required relationships become unresolved obligations.
 
-Future work could replace the stringy `Dim` layer and direct equality checks with symbolic constraints plus an SMT solver.
+Current limitations: `head` returns the scalar head as a dtype string rather than a scalar metadata value, and `maximum` handles broadcasting shape flow but not full NumPy ufunc dtype promotion or value semantics. Future work could replace the stringy `Dim` layer with symbolic constraints plus an SMT solver.

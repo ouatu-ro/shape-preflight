@@ -1,8 +1,8 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import argparse
 import time
-from typing import Any
+from enum import Enum
 import numpy as np
 
 # ---------------------------------------------------------------------
@@ -16,7 +16,7 @@ def vector_program(cli_args, more, *, np):
     kept = np.filter(nums)
     return nums, both, x, tail, kept
 
-def matmul_program(x, w1, w2, *, iters=100, np:Any=np):
+def matmul_program(x, w1, w2, *, iters=100, np=np):
     h = x
     for _ in range(iters):
         h = np.maximum(h @ w1, 0)
@@ -54,10 +54,42 @@ def dim(x):
         return Dim(str(x), x)
     raise TypeError(f"not a dimension: {x!r}")
 
-def runtime_compatible(a, b):
+class DimRelation(Enum):
+    PROVEN = "proven"
+    DISPROVEN = "disproven"
+    UNKNOWN = "unknown"
+
+def dim_relation(a, b):
     if a.value is not None and b.value is not None:
-        return a.value == b.value
-    return a.expr == b.expr
+        return DimRelation.PROVEN if a.value == b.value else DimRelation.DISPROVEN
+    if a.expr == b.expr:
+        return DimRelation.PROVEN
+    return DimRelation.UNKNOWN
+
+def dim_is_one(x):
+    return x.value == 1
+
+def broadcast_shapes(lhs, rhs):
+    out = []
+    obligations = []
+    max_rank = max(len(lhs), len(rhs))
+    for offset in range(1, max_rank + 1):
+        a = lhs[-offset] if offset <= len(lhs) else None
+        b = rhs[-offset] if offset <= len(rhs) else None
+        if a is None:
+            out.append(b)
+        elif b is None or dim_is_one(b):
+            out.append(a)
+        elif dim_is_one(a):
+            out.append(b)
+        else:
+            relation = dim_relation(a, b)
+            if relation is DimRelation.DISPROVEN:
+                return None, obligations, f"broadcast axis -{offset} requires {a} == {b} or one dimension is 1"
+            out.append(a)
+            if relation is DimRelation.UNKNOWN:
+                obligations.append(f"broadcast axis -{offset} requires {a} == {b} or one dimension is 1")
+    return tuple(reversed(out)), obligations, None
 
 def concrete_shape(shape):
     vals = []
@@ -101,24 +133,94 @@ class Obligation:
     op: str
     message: str
 
+@dataclass(frozen=True)
+class PreflightNode:
+    id: int
+    op: str
+    inputs: tuple[int, ...]
+    output_name: str
+    output_shape: tuple[Dim, ...]
+    output_dtype: str
+    attrs: dict[str, object] = field(default_factory=dict)
+
 @dataclass
-class Graph:
-    nodes: list[str]
+class PreflightGraph:
+    nodes: list[PreflightNode]
     violations: list[Violation]
     obligations: list[Obligation]
-    def add(self, text: str) -> int:
-        node = len(self.nodes)
-        self.nodes.append(text)
-        return node
+
+    def add_node(
+        self,
+        op: str,
+        inputs: tuple[MetaArray, ...],
+        output_name: str,
+        output_shape: tuple[Dim, ...],
+        output_dtype: str,
+        attrs: dict[str, object] | None = None,
+    ) -> MetaArray:
+        node_id = len(self.nodes)
+        output = MetaArray(output_shape, output_dtype, output_name, node_id)
+        self.nodes.append(
+            PreflightNode(
+                id=node_id,
+                op=op,
+                inputs=tuple(x.node for x in inputs if x.node >= 0),
+                output_name=output.name,
+                output_shape=output.shape,
+                output_dtype=output.dtype,
+                attrs=dict(attrs or {}),
+            )
+        )
+        return output
+
+    def add_input(self, name: str, shape: tuple[Dim, ...], dtype: str = "float32") -> MetaArray:
+        return self.add_node(
+            op="input",
+            inputs=(),
+            output_name=name,
+            output_shape=shape,
+            output_dtype=dtype,
+            attrs={"name": name},
+        )
+
+    def add_failed_op(
+        self,
+        op: str,
+        inputs: tuple[MetaArray, ...],
+        attrs: dict[str, object] | None = None,
+    ) -> int:
+        node_id = len(self.nodes)
+        self.nodes.append(
+            PreflightNode(
+                id=node_id,
+                op=op,
+                inputs=tuple(x.node for x in inputs if x.node >= 0),
+                output_name="",
+                output_shape=(),
+                output_dtype="",
+                attrs=dict(attrs or {}),
+            )
+        )
+        return node_id
+
     def violate(self, node: int, op: str, message: str):
         self.violations.append(Violation(node, op, message))
+
     def require(self, node: int, op: str, message: str):
         self.obligations.append(Obligation(node, op, message))
+
+    def format_node(self, node: PreflightNode) -> str:
+        args = ", ".join(str(i) for i in node.inputs)
+        if node.output_name:
+            output = MetaArray(node.output_shape, node.output_dtype, node.output_name, node.id)
+            return f"{node.op}({args}) -> {output}"
+        return f"{node.op}({args})"
+
     def report(self, last=8):
         shown = min(last, len(self.nodes))
-        print(f"\nshape graph: {len(self.nodes)} nodes, showing last {shown}")
-        for i, text in list(enumerate(self.nodes))[-last:]:
-            print(f"  [{i}] {text}")
+        print(f"\npreflight DAG: {len(self.nodes)} nodes, showing last {shown}")
+        for node in self.nodes[-last:]:
+            print(f"  [{node.id}] {self.format_node(node)}")
         if self.obligations:
             print("\nunresolved obligations:")
             for o in self.obligations:
@@ -135,98 +237,213 @@ class Graph:
         else:
             print("\npreflight status: ok")
 
+    def to_dot(self) -> str:
+        violations_by_node: dict[int, list[Violation]] = {}
+        for violation in self.violations:
+            violations_by_node.setdefault(violation.node, []).append(violation)
+        obligations_by_node: dict[int, list[Obligation]] = {}
+        for obligation in self.obligations:
+            obligations_by_node.setdefault(obligation.node, []).append(obligation)
+
+        lines = [
+            "digraph preflight_dag {",
+            "  rankdir=LR;",
+            "  node [shape=box];",
+            "",
+        ]
+        for node in self.nodes:
+            label = f"{node.id}: {node.op}"
+            if node.output_name:
+                output = MetaArray(node.output_shape, node.output_dtype, node.output_name, node.id)
+                label += f"\n{output}"
+            for violation in violations_by_node.get(node.id, []):
+                label += f"\nVIOLATION: {violation.message}"
+            for obligation in obligations_by_node.get(node.id, []):
+                label += f"\nOBLIGATION: {obligation.message}"
+            lines.append(f'  n{node.id} [label="{dot_escape(label)}"];')
+        for node in self.nodes:
+            for input_id in node.inputs:
+                lines.append(f"  n{input_id} -> n{node.id};")
+        lines.append("}")
+        return "\n".join(lines)
+
+def dot_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
 # ---------------------------------------------------------------------
 # SDK sketch: metadata-only NumPy-ish backend.
 # ---------------------------------------------------------------------
 
 class PreflightNP:
-    graph = Graph([], [], [])
+    graph = PreflightGraph([], [], [])
+
     @staticmethod
     def input(name, shape, dtype="float32"):
-        arr = MetaArray(shape, dtype, name)
-        node = PreflightNP.graph.add(f"input {arr}")
-        return MetaArray(shape, dtype, name, node)
+        return PreflightNP.graph.add_input(name, shape, dtype)
+
     @staticmethod
     def matmul(a, b):
-        node = PreflightNP.graph.add(f"matmul({a.name}, {b.name})")
+        attrs = {"lhs_shape": a.shape, "rhs_shape": b.shape}
         if a.ndim != 2 or b.ndim != 2:
+            node = PreflightNP.graph.add_failed_op("matmul", (a, b), attrs)
             PreflightNP.graph.violate(node, "matmul", f"expected matrices, got {a} and {b}")
             raise TypeError(f"matmul expects matrices, got {a} and {b}")
         n, m = a.shape
         m2, k = b.shape
-        if not runtime_compatible(m, m2):
+        attrs |= {
+            "contract_lhs": m,
+            "contract_rhs": m2,
+        }
+        relation = dim_relation(m, m2)
+        if relation is DimRelation.DISPROVEN:
+            node = PreflightNP.graph.add_failed_op("matmul", (a, b), attrs)
             msg = f"inner dimension requires {m} == {m2}"
             PreflightNP.graph.violate(node, "matmul", msg)
             raise TypeError(f"bad matmul: {a.shape} @ {b.shape}; {msg}")
-        out = MetaArray((n, k), a.dtype, f"matmul_{node}", node)
-        PreflightNP.graph.nodes[node] += f" -> {out}"
+        out = PreflightNP.graph.add_node(
+            op="matmul",
+            inputs=(a, b),
+            output_name=f"matmul_{len(PreflightNP.graph.nodes)}",
+            output_shape=(n, k),
+            output_dtype=a.dtype,
+            attrs=attrs,
+        )
+        if relation is DimRelation.UNKNOWN:
+            PreflightNP.graph.require(out.node, "matmul", f"requires {m} == {m2}")
         return out
+
     @staticmethod
     def maximum(a, b):
-        # Demo-only: scalar maximum, no NumPy broadcasting model.
-        node = PreflightNP.graph.add(f"maximum({a.name}, {b})")
-        out = MetaArray(a.shape, a.dtype, f"relu_{node}", node)
-        PreflightNP.graph.nodes[node] += f" -> {out}"
+        if not isinstance(a, MetaArray) and isinstance(b, MetaArray):
+            return PreflightNP.maximum(b, a)
+        if not isinstance(a, MetaArray):
+            raise TypeError(f"maximum expects at least one metadata array, got {a!r} and {b!r}")
+
+        inputs = (a, b) if isinstance(b, MetaArray) else (a,)
+        attrs = {"rhs_shape": b.shape, "rhs_dtype": b.dtype} if isinstance(b, MetaArray) else {"rhs_scalar": b}
+        output_shape = a.shape
+        obligations = []
+        if isinstance(b, MetaArray):
+            output_shape, obligations, violation = broadcast_shapes(a.shape, b.shape)
+            if violation is not None:
+                node = PreflightNP.graph.add_failed_op("maximum", inputs, attrs)
+                PreflightNP.graph.violate(node, "maximum", violation)
+                raise TypeError(f"maximum broadcast mismatch: {violation}")
+
+        out = PreflightNP.graph.add_node(
+            op="maximum",
+            inputs=inputs,
+            output_name=f"relu_{len(PreflightNP.graph.nodes)}",
+            output_shape=output_shape,
+            output_dtype=a.dtype,
+            attrs=attrs,
+        )
+        for obligation in obligations:
+            PreflightNP.graph.require(out.node, "maximum", obligation)
         return out
+
     @staticmethod
     def parse_ints(strings):
-        node = PreflightNP.graph.add(f"parse_ints({strings.name})")
         if strings.ndim != 1 or strings.dtype != "String":
+            node = PreflightNP.graph.add_failed_op("parse_ints", (strings,))
             PreflightNP.graph.violate(node, "parse_ints", f"expected Vec<String, n>, got {strings}")
             raise TypeError(f"parse_ints expects Vec<String, n>, got {strings}")
-        out = MetaArray(strings.shape, "Int", "nums", node)
-        PreflightNP.graph.nodes[node] += f" -> {out}"
-        return out
+        return PreflightNP.graph.add_node(
+            op="parse_ints",
+            inputs=(strings,),
+            output_name="nums",
+            output_shape=strings.shape,
+            output_dtype="Int",
+        )
+
     @staticmethod
     def concat0(xs, ys):
-        node = PreflightNP.graph.add(f"concat0({xs.name}, {ys.name})")
         if xs.ndim != ys.ndim:
+            node = PreflightNP.graph.add_failed_op("concat0", (xs, ys))
             PreflightNP.graph.violate(node, "concat0", f"rank mismatch: {xs} vs {ys}")
             raise TypeError(f"concat0 rank mismatch: {xs} vs {ys}")
         if xs.dtype != ys.dtype:
+            node = PreflightNP.graph.add_failed_op("concat0", (xs, ys))
             PreflightNP.graph.violate(node, "concat0", f"dtype mismatch: {xs.dtype} vs {ys.dtype}")
             raise TypeError(f"concat0 dtype mismatch: {xs.dtype} vs {ys.dtype}")
         for i, (a, b) in enumerate(zip(xs.shape[1:], ys.shape[1:]), start=1):
-            if not runtime_compatible(a, b):
+            relation = dim_relation(a, b)
+            if relation is DimRelation.DISPROVEN:
+                node = PreflightNP.graph.add_failed_op("concat0", (xs, ys), {"axis": i})
                 PreflightNP.graph.violate(node, "concat0", f"axis {i} requires {a} == {b}")
                 raise TypeError(f"concat0 mismatch at axis {i}: {a} != {b}")
-        out = MetaArray((xs.shape[0] + ys.shape[0], *xs.shape[1:]), xs.dtype, f"concat0({xs.name},{ys.name})", node)
-        PreflightNP.graph.nodes[node] += f" -> {out}"
+        out = PreflightNP.graph.add_node(
+            op="concat0",
+            inputs=(xs, ys),
+            output_name=f"concat0({xs.name},{ys.name})",
+            output_shape=(xs.shape[0] + ys.shape[0], *xs.shape[1:]),
+            output_dtype=xs.dtype,
+        )
+        for i, (a, b) in enumerate(zip(xs.shape[1:], ys.shape[1:]), start=1):
+            if dim_relation(a, b) is DimRelation.UNKNOWN:
+                PreflightNP.graph.require(out.node, "concat0", f"axis {i} requires {a} == {b}")
         return out
+
     @staticmethod
     def head(xs):
-        node = PreflightNP.graph.add(f"head({xs.name})")
         if xs.ndim != 1:
+            node = PreflightNP.graph.add_failed_op("head", (xs,))
             PreflightNP.graph.violate(node, "head", f"expected Vec<T, n>, got {xs}")
             raise TypeError(f"head expects Vec<T, n>, got {xs}")
         n = xs.shape[0]
         if n.value == 0:
+            node = PreflightNP.graph.add_failed_op("head", (xs,), {"head_dtype": xs.dtype})
             PreflightNP.graph.violate(node, "head", f"requires {n} > 0")
             raise TypeError(f"head requires nonempty Vec, got {xs}")
+        tail = PreflightNP.graph.add_node(
+            op="head",
+            inputs=(xs,),
+            output_name=f"tail({xs.name})",
+            output_shape=(n - 1,),
+            output_dtype=xs.dtype,
+            attrs={"head_dtype": xs.dtype},
+        )
         if n.value is None:
-            PreflightNP.graph.require(node, "head", f"requires {n} > 0")
-        tail = MetaArray((n - 1,), xs.dtype, f"tail({xs.name})", node)
-        PreflightNP.graph.nodes[node] += f" -> ({xs.dtype}, {tail})"
+            PreflightNP.graph.require(tail.node, "head", f"requires {n} > 0")
         return xs.dtype, tail
+
     @staticmethod
     def filter(xs):
-        node = PreflightNP.graph.add(f"filter({xs.name})")
         if xs.ndim != 1:
+            node = PreflightNP.graph.add_failed_op("filter", (xs,))
             PreflightNP.graph.violate(node, "filter", f"expected Vec<T, n>, got {xs}")
             raise TypeError(f"filter expects Vec<T, n>, got {xs}")
-        out = MetaArray((Dim(f"?filter({xs.name})"),), xs.dtype, f"filter({xs.name})", node)
-        PreflightNP.graph.nodes[node] += f" -> {out}"
-        return out
+        return PreflightNP.graph.add_node(
+            op="filter",
+            inputs=(xs,),
+            output_name=f"filter({xs.name})",
+            output_shape=(Dim(f"?filter({xs.name})"),),
+            output_dtype=xs.dtype,
+        )
 
 # ---------------------------------------------------------------------
 # Demo runners: construct inputs, run programs, print reports.
 # ---------------------------------------------------------------------
 
+MATMUL_PRESETS = {
+    "small": (64, 64, 32),
+    "large": (4096, 2048, 1024),
+}
+
 def reset_preflight():
-    PreflightNP.graph = Graph([], [], [])
+    PreflightNP.graph = PreflightGraph([], [], [])
+
+def resolved_matmul_dims(args):
+    n, d, k = MATMUL_PRESETS[args.preset]
+    return (
+        args.n if args.n is not None else n,
+        args.d if args.d is not None else d,
+        args.k if args.k is not None else k,
+    )
 
 def matmul_input_specs(args):
-    n, d, k = Dim("n", args.n), Dim("d", args.d), Dim("k", args.k)
+    n_value, d_value, k_value = resolved_matmul_dims(args)
+    n, d, k = Dim("n", n_value), Dim("d", d_value), Dim("k", k_value)
     w2_rows = k if args.case == "bad-final-inner" else d
     return (
         ("x", (n, d)),
@@ -253,6 +470,7 @@ def run_vector_demo(args):
     finally:
         PreflightNP.graph.report()
         PreflightNP.graph.status()
+        emit_dot(args)
 
 def matmul_meta_inputs(args):
     return tuple(MetaArray(shape, "float32", name) for name, shape in matmul_input_specs(args))
@@ -280,6 +498,7 @@ def run_matmul_preflight_demo(args):
     PreflightNP.graph.status()
     if out is not None:
         print("planned output:", out)
+    emit_dot(args)
 
 def run_matmul_execute_demo(args):
     x, w1, w2 = matmul_meta_inputs(args)
@@ -289,11 +508,27 @@ def run_matmul_execute_demo(args):
     out = timed("EXECUTE model-only", lambda: matmul_program(xr, w1r, w2r, iters=args.iters))
     if out is not None:
         print("real output:", out.shape, out.dtype)
+    if args.dot or args.dot_file:
+        print("DOT export is only available for preflight runs.")
 
 def run_matmul_demo(args):
     if args.run == "preflight":
         return run_matmul_preflight_demo(args)
     return run_matmul_execute_demo(args)
+
+def emit_dot(args):
+    dot = None
+    if args.dot_file:
+        dot = PreflightNP.graph.to_dot()
+        with open(args.dot_file, "w", encoding="utf-8") as f:
+            f.write(dot)
+            f.write("\n")
+        print(f"\nwrote DOT: {args.dot_file}")
+    if args.dot:
+        if dot is None:
+            dot = PreflightNP.graph.to_dot()
+        print("\nDOT:")
+        print(dot)
 
 # ---------------------------------------------------------------------
 # CLI: parse command-line args and dispatch to demo runners.
@@ -324,6 +559,7 @@ def build_parser():
         default=2,
         help="length m of the second vector used by concat0(nums, more)",
     )
+    add_dot_args(vector)
     matmul = sub.add_parser(
         "matmul",
         help="demo early shape failure for repeated matrix multiplication",
@@ -341,13 +577,18 @@ def build_parser():
         default="ok",
         help="bad-final-inner makes w2 rows = k instead of d, so final h @ w2 violates d == k",
     )
-    matmul.add_argument("--n", type=int, default=4096, help="batch/input rows: x has shape Mat<float32, n, d>")
-    matmul.add_argument("--d", type=int, default=2048, help="hidden width: x columns, w1 rows/cols, and valid w2 rows")
+    matmul.add_argument(
+        "--preset",
+        choices=tuple(MATMUL_PRESETS),
+        default="small",
+        help="dimension preset; small is safe for casual execute runs, large shows the expensive-work motivation",
+    )
+    matmul.add_argument("--n", type=int, help="override batch/input rows: x has shape Mat<float32, n, d>")
+    matmul.add_argument("--d", type=int, help="override hidden width: x columns, w1 rows/cols, and valid w2 rows")
     matmul.add_argument(
         "--k",
         type=int,
-        default=1024,
-        help="output width: valid w2 has shape Mat<float32, d, k>; bad case uses Mat<float32, k, k>",
+        help="override output width: valid w2 has shape Mat<float32, d, k>; bad case uses Mat<float32, k, k>",
     )
     matmul.add_argument(
         "--iters",
@@ -355,7 +596,12 @@ def build_parser():
         default=100,
         help="number of repeated h = maximum(h @ w1, 0) steps before final h @ w2",
     )
+    add_dot_args(matmul)
     return parser
+
+def add_dot_args(parser):
+    parser.add_argument("--dot", action="store_true", help="print Graphviz DOT for the preflight DAG")
+    parser.add_argument("--dot-file", help="write Graphviz DOT for the preflight DAG to PATH", metavar="PATH")
 
 def main():
     parser = build_parser()
