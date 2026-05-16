@@ -31,29 +31,37 @@ def matmul_program(x, w1, w2, *, iters=100, np:Any=np):
 # ---------------------------------------------------------------------
 
 MATMUL_PRESETS = {
-    "small": (64, 64, 32),
-    "large": (4096, 2048, 1024),
+    "small": {"n": 64, "d": 64, "k": 32, "out": 16},
+    "large": {"n": 4096, "d": 2048, "k": 1024, "out": 512},
 }
 
 def reset_preflight():
     PreflightNP.graph = PreflightGraph([], [], [])
 
-def resolved_matmul_dims(args):
-    n, d, k = MATMUL_PRESETS[args.preset]
-    return (
-        args.n if args.n is not None else n,
-        args.d if args.d is not None else d,
-        args.k if args.k is not None else k,
-    )
+def resolved_matmul_dims(args) -> dict[str, int]:
+    preset = MATMUL_PRESETS[args.preset]
+    return {
+        "n": args.n if args.n is not None else preset["n"],
+        "d": args.d if args.d is not None else preset["d"],
+        "k": args.k if args.k is not None else preset["k"],
+        "out": args.out if args.out is not None else preset["out"],
+    }
 
-def matmul_input_specs(args):
-    n_value, d_value, k_value = resolved_matmul_dims(args)
-    n, d, k = Dim("n", n_value), Dim("d", d_value), Dim("k", k_value)
-    w2_rows = k if args.case == "bad-final-inner" else d
+def matmul_dim(args, name: str, *, concrete: bool) -> Dim:
+    values = resolved_matmul_dims(args)
+    value = values[name] if concrete or getattr(args, name) is not None else None
+    return Dim(name, value)
+
+def matmul_input_specs(args, *, concrete: bool = False):
+    n = matmul_dim(args, "n", concrete=concrete)
+    d = matmul_dim(args, "d", concrete=concrete)
+    k = matmul_dim(args, "k", concrete=concrete)
+    out = matmul_dim(args, "out", concrete=concrete)
+    w2_rows = d if args.w2_rows == "d" else k
     return (
         ("x", (n, d)),
         ("w1", (d, d)),
-        ("w2", (w2_rows, k)),
+        ("w2", (w2_rows, out)),
     )
 
 def run_vector_demo(args):
@@ -78,7 +86,7 @@ def run_vector_demo(args):
         emit_dot(args)
 
 def matmul_meta_inputs(args):
-    return tuple(MetaArray(shape, "float32", name) for name, shape in matmul_input_specs(args))
+    return tuple(MetaArray(shape, "float32", name) for name, shape in matmul_input_specs(args, concrete=True))
 
 
 def materialize_numpy(meta):
@@ -98,9 +106,10 @@ def timed(label, fn):
 def run_matmul_preflight_demo(args):
     reset_preflight()
     x, w1, w2 = (PreflightNP.input(name, shape) for name, shape in matmul_input_specs(args))
-    print(f"preflight inputs: {x}; {w1}; {w2}; iters={args.iters}")
+    print(f"input shape specs: {x}; {w1}; {w2}; iters={args.iters}")
     out = timed("PREFLIGHT model-only", lambda: matmul_program(x, w1, w2, np=PreflightNP, iters=args.iters))
     PreflightNP.graph.report()
+    print_matmul_preflight_report(args)
     PreflightNP.graph.status()
     if out is not None:
         print("planned output:", out)
@@ -136,6 +145,26 @@ def emit_dot(args):
         print("\nDOT:")
         print(dot)
 
+def print_matmul_preflight_report(args):
+    matmul_obligations = [o for o in PreflightNP.graph.obligations if o.op == "matmul"]
+    if not matmul_obligations:
+        return
+
+    print("\npreflight report:")
+    values = resolved_matmul_dims(args)
+    for obligation in matmul_obligations:
+        node = PreflightNP.graph.nodes[obligation.node]
+        lhs = node.attrs.get("contract_lhs")
+        rhs = node.attrs.get("contract_rhs")
+        if isinstance(lhs, Dim) and isinstance(rhs, Dim):
+            print(f"  potential shape failure at matmul node [{obligation.node}]")
+            print(f"    required: {lhs.expr} == {rhs.expr}")
+            print("    reason: input specs do not guarantee that relation")
+            if lhs.expr in values and rhs.expr in values and values[lhs.expr] != values[rhs.expr]:
+                print(f"    example failing assignment: {lhs.expr} = {values[lhs.expr]}, {rhs.expr} = {values[rhs.expr]}")
+        else:
+            print(f"  potential shape failure at matmul node [{obligation.node}]: {obligation.message}")
+
 # ---------------------------------------------------------------------
 # CLI: parse command-line args and dispatch to demo runners.
 # ---------------------------------------------------------------------
@@ -168,7 +197,7 @@ def build_parser():
     add_dot_args(vector)
     matmul = sub.add_parser(
         "matmul",
-        help="demo early shape failure for repeated matrix multiplication",
+        help="trace matrix code over symbolic input specs",
         allow_abbrev=False,
     )
     matmul.add_argument(
@@ -178,23 +207,28 @@ def build_parser():
         help="preflight runs over metadata only; execute allocates real NumPy arrays",
     )
     matmul.add_argument(
-        "--case",
-        choices=("ok", "bad-final-inner"),
-        default="ok",
-        help="bad-final-inner makes w2 rows = k instead of d, so final h @ w2 violates d == k",
+        "--w2-rows",
+        choices=("d", "k"),
+        default="d",
+        help="symbol used for w2 rows; k leaves final h @ w2 underconstrained because it requires d == k",
     )
     matmul.add_argument(
         "--preset",
         choices=tuple(MATMUL_PRESETS),
         default="small",
-        help="dimension preset; small is safe for casual execute runs, large shows the expensive-work motivation",
+        help="concrete dimension preset for execute runs and counterexample values",
     )
-    matmul.add_argument("--n", type=int, help="override batch/input rows: x has shape Mat<float32, n, d>")
-    matmul.add_argument("--d", type=int, help="override hidden width: x columns, w1 rows/cols, and valid w2 rows")
+    matmul.add_argument("--n", type=int, help="assign concrete value for input rows n")
+    matmul.add_argument("--d", type=int, help="assign concrete value for hidden width d")
     matmul.add_argument(
         "--k",
         type=int,
-        help="override output width: valid w2 has shape Mat<float32, d, k>; bad case uses Mat<float32, k, k>",
+        help="assign concrete value for alternate w2 row symbol k",
+    )
+    matmul.add_argument(
+        "--out",
+        type=int,
+        help="assign concrete value for output width out",
     )
     matmul.add_argument(
         "--iters",
